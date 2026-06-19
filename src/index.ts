@@ -1,8 +1,15 @@
 export default {
 	async fetch(_request: Request, env: Env): Promise<Response> {
-		const inputs = {
-			prompt: "Wide 16:9 hand-drawn explainer cartoon, imperfect black marker outlines, flat colors, white circular-headed stick figure protagonist with short messy dark-brown hair, expressive round eyes, small eyebrows and mouth, minimal torso and thin stick limbs, simple high-contrast composition, readable in one to two seconds. No realistic humans, no 3D, no cinematic lighting, no glossy vector art, no decorative detail that does not improve comprehension. Visual type: narrative explainer scene. Sentence meaning: If you did nothing, you assume you should have energy. Composition: protagonist acting out the sentence with one clear prop or visual metaphor. Background: simple scene-appropriate background. The protagonist's emotion is clear, readable emotion matching the sentence. Exact hand-written on-screen text: DID NOTHING. Communicate exactly this sentence and no additional story beat.",
-		} satisfies AiTextToImageInput;
+		// src/index.ts 示例
+
+const inputs = {
+  // 把提示词写得尽可能具体（见第二步）
+  prompt: "A photorealistic, panoramic portrait of a futuristic city in the rain, neon lights, 16:9 ratio, ultra-detailed, 8k", 
+  
+  // 🌟 核心修改：手动设置符合 16:9 的分辨率
+  width: 1024,   // 宽度
+  height: 576    // 高度 (1024 * 9 / 16)
+} satisfies AiTextToImageInput;
 
 		const response =
 			await env.AI.run<"@cf/stabilityai/stable-diffusion-xl-base-1.0">(
