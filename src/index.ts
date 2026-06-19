@@ -30,6 +30,18 @@ type ModelSpec = {
 	tag: string;
 	mime: string;
 	needs: "none" | "image" | "image+mask";
+	output: "stream" | "json-b64";
+	supports: {
+		width: boolean;
+		negative_prompt: boolean;
+		strength: boolean;
+		steps: boolean;
+		seed: boolean;
+	};
+	stepsParam: "num_steps" | "steps";
+	stepsDefault: number;
+	stepsMax: number;
+	payNote?: string;
 	hint: string;
 };
 
@@ -40,6 +52,11 @@ const MODELS: Record<string, ModelSpec> = {
 		tag: "Stability · 高质量",
 		mime: "image/jpeg",
 		needs: "none",
+		output: "stream",
+		supports: { width: true, negative_prompt: true, strength: true, steps: true, seed: true },
+		stepsParam: "num_steps",
+		stepsDefault: 20,
+		stepsMax: 20,
 		hint: "通用文生图，质量最好；可选传参考图做 img2img。",
 	},
 	"@cf/bytedance/stable-diffusion-xl-lightning": {
@@ -48,6 +65,11 @@ const MODELS: Record<string, ModelSpec> = {
 		tag: "ByteDance · 极速",
 		mime: "image/jpeg",
 		needs: "none",
+		output: "stream",
+		supports: { width: true, negative_prompt: true, strength: true, steps: true, seed: true },
+		stepsParam: "num_steps",
+		stepsDefault: 20,
+		stepsMax: 20,
 		hint: "几秒出图，适合快速试风格。",
 	},
 	"@cf/runwayml/stable-diffusion-v1-5-img2img": {
@@ -56,6 +78,11 @@ const MODELS: Record<string, ModelSpec> = {
 		tag: "RunwayML · 图生图",
 		mime: "image/png",
 		needs: "image",
+		output: "stream",
+		supports: { width: true, negative_prompt: true, strength: true, steps: true, seed: true },
+		stepsParam: "num_steps",
+		stepsDefault: 20,
+		stepsMax: 20,
 		hint: "传角色参考图后用 strength 控制动作/姿态变化幅度。",
 	},
 	"@cf/runwayml/stable-diffusion-v1-5-inpainting": {
@@ -64,7 +91,26 @@ const MODELS: Record<string, ModelSpec> = {
 		tag: "RunwayML · 局部重绘",
 		mime: "image/png",
 		needs: "image+mask",
+		output: "stream",
+		supports: { width: true, negative_prompt: true, strength: true, steps: true, seed: true },
+		stepsParam: "num_steps",
+		stepsDefault: 20,
+		stepsMax: 20,
 		hint: "需要参考图 + mask，mask 白色区域会被重绘。",
+	},
+	"@cf/black-forest-labs/flux-1-schnell": {
+		id: "@cf/black-forest-labs/flux-1-schnell",
+		name: "Flux 1 Schnell",
+		tag: "Black Forest Labs · 12B rectified flow",
+		mime: "image/jpeg",
+		needs: "none",
+		output: "json-b64",
+		supports: { width: false, negative_prompt: false, strength: false, steps: true, seed: true },
+		stepsParam: "steps",
+		stepsDefault: 4,
+		stepsMax: 8,
+		payNote: "付费 · $0.00011/步 + 图像 tile 费",
+		hint: "12B rectified flow，几步出图（默认 4 步）。不支持尺寸/反向词/img2img。",
 	},
 };
 
@@ -98,6 +144,45 @@ function jsonError(status: number, message: string): Response {
 		status,
 		headers: { "content-type": "application/json; charset=utf-8" },
 	});
+}
+
+// Flux 专用：只支持 prompt / steps(1-8) / seed；不支持 width/height/negative/strength/img2img
+// 输出是 JSON { image: base64 }，不是 stream
+async function handleFlux(body: GenBody, env: Env, spec: ModelSpec): Promise<Response> {
+	const prompt = (body.prompt || "").trim();
+	if (!prompt) return jsonError(400, "提示词不能为空");
+
+	const steps = clamp(
+		Math.round(Number(body.num_steps) || spec.stepsDefault),
+		1,
+		spec.stepsMax,
+	);
+	const seed =
+		typeof body.seed === "number" && Number.isFinite(body.seed)
+			? Math.round(body.seed)
+			: undefined;
+
+	const inputs: Record<string, unknown> = { prompt, steps };
+	if (seed != null) inputs.seed = seed;
+
+	try {
+		const res = (await env.AI.run(spec.id, inputs)) as { image?: string };
+		const b64 = res?.image;
+		if (!b64) return jsonError(500, "flux 返回为空");
+		const bin = atob(b64);
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+		return new Response(bytes, {
+			headers: {
+				"content-type": "image/jpeg",
+				"cache-control": "no-store",
+				"x-model": spec.id,
+			},
+		});
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return jsonError(500, `flux 生成失败: ${msg}`);
+	}
 }
 
 async function handleGenerate(request: Request, env: Env): Promise<Response> {
@@ -139,6 +224,11 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 	if (!prompt) return jsonError(400, "提示词不能为空");
 
 	const spec = getModel(body.model);
+
+	// Flux schnell：入参/输出格式都不一样，走专用路径
+	if (spec.id === "@cf/black-forest-labs/flux-1-schnell") {
+		return handleFlux(body, env, spec);
+	}
 
 	const width = sanitizeDim(body.width, spec.needs === "image+mask" ? 512 : 1024);
 	const height = sanitizeDim(body.height, spec.needs === "image+mask" ? 512 : 576);
@@ -211,17 +301,26 @@ function b64ToBytes(b64: string): number[] {
 
 function pageHTML(): string {
 	const modelOptions = Object.values(MODELS)
-		.map(
-			(m) => `
-      <label class="model-card" data-model="${m.id}" data-needs="${m.needs}">
+		.map((m) => {
+			const supportedKeys = Object.entries(m.supports)
+				.filter(([, v]) => v)
+				.map(([k]) => k)
+				.join(",");
+			return `
+      <label class="model-card" data-model="${m.id}" data-needs="${m.needs}" data-output="${m.output}"
+        data-supports="${supportedKeys}" data-steps-param="${m.stepsParam}"
+        data-steps-default="${m.stepsDefault}" data-steps-max="${m.stepsMax}">
         <input type="radio" name="model" value="${m.id}" ${m.id === DEFAULT_MODEL ? "checked" : ""}/>
         <div class="mc-body">
-          <div class="mc-name">${m.name}</div>
+          <div class="mc-row">
+            <span class="mc-name">${m.name}</span>
+            ${m.payNote ? '<span class="mc-pay">付费</span>' : ""}
+          </div>
           <div class="mc-tag">${m.tag}</div>
           <div class="mc-hint">${m.hint}</div>
         </div>
-      </label>`,
-		)
+      </label>`;
+		})
 		.join("");
 
 	return `<!doctype html>
@@ -282,9 +381,13 @@ function pageHTML(): string {
   .model-card:hover { border-color: var(--accent); }
   .model-card input { position: absolute; opacity: 0; pointer-events: none; }
   .model-card .mc-name { font-size: 14px; font-weight: 600; }
+  .model-card .mc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .model-card .mc-pay { font-size: 10px; color: #ffb84d; background: rgba(255,184,77,.12); border: 1px solid rgba(255,184,77,.3); padding: 1px 6px; border-radius: 4px; }
   .model-card .mc-tag { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .model-card .mc-hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.45; }
   .model-card.checked { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(124,92,255,.18); }
+  textarea:disabled, input:disabled { opacity: 0.35; cursor: not-allowed; }
+  .presets.dim { opacity: 0.35; pointer-events: none; }
 
   /* 文件上传 */
   .file-drop {
@@ -514,20 +617,58 @@ function dataURLToBlob(dataUrl) {
   return new Blob([arr], { type: mime });
 }
 
-// 模型选择
+// 模型选择 + 按模型能力启用/禁用控件
+function getCurrentSpec() {
+  const card = modelGrid.querySelector("input:checked")?.closest(".model-card");
+  if (!card) return null;
+  const supportedKeys = (card.dataset.supports || "").split(",").filter(Boolean);
+  const supports = {
+    width: supportedKeys.includes("width"),
+    negative_prompt: supportedKeys.includes("negative_prompt"),
+    strength: supportedKeys.includes("strength"),
+    steps: supportedKeys.includes("steps"),
+    seed: supportedKeys.includes("seed"),
+  };
+  return {
+    id: card.dataset.model,
+    needs: card.dataset.needs,
+    output: card.dataset.output,
+    supports,
+    stepsParam: card.dataset.stepsParam,
+    stepsDefault: parseInt(card.dataset.stepsDefault, 10) || 20,
+    stepsMax: parseInt(card.dataset.stepsMax, 10) || 20,
+  };
+}
+
 function refreshModelChecked() {
   const checked = modelGrid.querySelector("input:checked");
   modelGrid.querySelectorAll(".model-card").forEach((c) => {
     c.classList.toggle("checked", c.querySelector("input") === checked);
   });
-  if (checked) {
-    const needs = checked.closest(".model-card").dataset.needs;
-    strengthRow.classList.toggle("dim", !(refDataUrl && (needs === "image" || needs === "image+mask")));
-    // 模型切换时给个尺寸提示
-    if (needs === "image+mask" && (wEl.value === "1024" || wEl.value === "1920")) {
-      // 留作提示，不强制
-    }
+  const spec = getCurrentSpec();
+  if (!spec) return;
+
+  // 尺寸相关
+  const dimEnabled = spec.supports.width;
+  wEl.disabled = !dimEnabled;
+  hEl.disabled = !dimEnabled;
+  presets.classList.toggle("dim", !dimEnabled);
+
+  // 反向提示词
+  negEl.disabled = !spec.supports.negative_prompt;
+
+  // steps placeholder 提示
+  if (spec.supports.steps) {
+    numStepsEl.placeholder = spec.stepsParam === "steps"
+      ? spec.stepsDefault + " (1-" + spec.stepsMax + ")"
+      : "默认 " + spec.stepsDefault + " (1-" + spec.stepsMax + ")";
+  } else {
+    numStepsEl.placeholder = "不支持";
   }
+
+  // strength：仅当模型支持 strength 且已传参考图时可用
+  const strengthAvailable = spec.supports.strength && !!refDataUrl;
+  strengthRow.classList.toggle("dim", !strengthAvailable);
 }
 modelGrid.addEventListener("change", refreshModelChecked);
 refreshModelChecked();
@@ -717,29 +858,35 @@ function showLoading() {
 async function generate() {
   const prompt = promptEl.value.trim();
   if (!prompt) { setStatus("提示词不能为空", "err"); promptEl.focus(); return; }
-  const model = modelGrid.querySelector("input:checked")?.value;
+  const spec = getCurrentSpec();
+  if (!spec) { setStatus("未选模型", "err"); return; }
+  const model = spec.id;
+
+  // 校验：必需 image/mask
+  if ((spec.needs === "image" || spec.needs === "image+mask") && !refDataUrl) {
+    setStatus("当前模型需要上传参考图", "err"); return;
+  }
+  if (spec.needs === "image+mask" && !maskDataUrl) {
+    setStatus("inpainting 需要 mask（白色区域将被重绘）", "err"); return;
+  }
+
   const width = parseInt(wEl.value, 10) || 1024;
   const height = parseInt(hEl.value, 10) || 576;
   const negative_prompt = negEl.value.trim();
-  const strength = refDataUrl ? parseFloat(strengthEl.value) : undefined;
-  const num_steps = numStepsEl.value ? parseInt(numStepsEl.value, 10) : undefined;
+  const strength = (spec.supports.strength && refDataUrl) ? parseFloat(strengthEl.value) : undefined;
+  const num_steps = spec.supports.steps && numStepsEl.value ? parseInt(numStepsEl.value, 10) : undefined;
   const guidance = guidanceEl.value ? parseFloat(guidanceEl.value) : undefined;
-  const seed = seedEl.value ? parseInt(seedEl.value, 10) : undefined;
-
-  const needs = modelGrid.querySelector("input:checked").closest(".model-card").dataset.needs;
-  if ((needs === "image" || needs === "image+mask") && !refDataUrl) {
-    setStatus("当前模型需要上传参考图", "err"); return;
-  }
-  if (needs === "image+mask" && !maskDataUrl) {
-    setStatus("inpainting 需要 mask（白色区域将被重绘）", "err"); return;
-  }
+  const seed = spec.supports.seed && seedEl.value ? parseInt(seedEl.value, 10) : undefined;
 
   setStatus("正在生成…");
   goBtn.disabled = true;
   showLoading();
 
   const payload = {
-    model, prompt, width, height, negative_prompt: negative_prompt || undefined,
+    model, prompt,
+    width: spec.supports.width ? width : undefined,
+    height: spec.supports.width ? height : undefined,
+    negative_prompt: spec.supports.negative_prompt ? (negative_prompt || undefined) : undefined,
     strength, num_steps, guidance, seed,
     image_b64: refDataUrl ? refDataUrl.split(",")[1] : undefined,
     mask_b64: maskDataUrl ? maskDataUrl.split(",")[1] : undefined,
