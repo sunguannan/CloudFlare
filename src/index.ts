@@ -31,6 +31,7 @@ type ModelSpec = {
 	mime: string;
 	needs: "none" | "image" | "image+mask";
 	output: "stream" | "json-b64";
+	multipart?: boolean; // true → 用 FormData 包装调用
 	supports: {
 		width: boolean;
 		negative_prompt: boolean;
@@ -109,8 +110,35 @@ const MODELS: Record<string, ModelSpec> = {
 		stepsParam: "steps",
 		stepsDefault: 4,
 		stepsMax: 8,
-		payNote: "付费 · $0.00011/步 + 图像 tile 费",
-		hint: "12B rectified flow，几步出图（默认 4 步）。不支持尺寸/反向词/img2img。",
+		hint: "12B rectified flow，几步出图（默认 4 步）。⚠️ 不支持自定义尺寸（只 1024×1024）/反向词/img2img。",
+	},
+	"@cf/black-forest-labs/flux-2-klein-9b": {
+		id: "@cf/black-forest-labs/flux-2-klein-9b",
+		name: "Flux 2 Klein 9B",
+		tag: "Black Forest Labs · 9B distilled",
+		mime: "image/jpeg",
+		needs: "none",
+		output: "json-b64",
+		multipart: true,
+		supports: { width: true, negative_prompt: false, strength: false, steps: true, seed: true },
+		stepsParam: "steps",
+		stepsDefault: 25,
+		stepsMax: 50,
+		hint: "FLUX.2 distilled 9B，几步出图质量好。支持 width/height/steps。",
+	},
+	"@cf/black-forest-labs/flux-2-dev": {
+		id: "@cf/black-forest-labs/flux-2-dev",
+		name: "Flux 2 Dev",
+		tag: "Black Forest Labs · multi-reference",
+		mime: "image/jpeg",
+		needs: "none",
+		output: "json-b64",
+		multipart: true,
+		supports: { width: true, negative_prompt: false, strength: false, steps: true, seed: true },
+		stepsParam: "steps",
+		stepsDefault: 25,
+		stepsMax: 50,
+		hint: "FLUX.2 写实人像/多参考图能力强。支持 width/height/steps。",
 	},
 };
 
@@ -185,6 +213,58 @@ async function handleFlux(body: GenBody, env: Env, spec: ModelSpec): Promise<Res
 	}
 }
 
+// Flux 2 (klein-9b / dev)：用 multipart/form-data 调，输出也是 { image: b64 }
+async function handleFlux2(body: GenBody, env: Env, spec: ModelSpec): Promise<Response> {
+	const prompt = (body.prompt || "").trim();
+	if (!prompt) return jsonError(400, "提示词不能为空");
+
+	const width = sanitizeDim(body.width, 1024);
+	const height = sanitizeDim(body.height, 1024);
+	const steps = clamp(
+		Math.round(Number(body.num_steps) || spec.stepsDefault),
+		1,
+		spec.stepsMax,
+	);
+	const seed =
+		typeof body.seed === "number" && Number.isFinite(body.seed)
+			? Math.round(body.seed)
+			: undefined;
+
+	const form = new FormData();
+	form.append("prompt", prompt);
+	form.append("width", String(width));
+	form.append("height", String(height));
+	form.append("steps", String(steps));
+	if (seed != null) form.append("seed", String(seed));
+
+	// 把 FormData 包成 stream + content-type 传给 AI.run
+	const formResp = new Response(form);
+	const formStream = formResp.body;
+	const formCT = formResp.headers.get("content-type") || "";
+	if (!formStream) return jsonError(500, "FormData 序列化失败");
+
+	try {
+		const res = (await env.AI.run(spec.id, {
+			multipart: { body: formStream, contentType: formCT },
+		})) as { image?: string };
+		const b64 = res?.image;
+		if (!b64) return jsonError(500, "flux-2 返回为空");
+		const bin = atob(b64);
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+		return new Response(bytes, {
+			headers: {
+				"content-type": "image/jpeg",
+				"cache-control": "no-store",
+				"x-model": spec.id,
+			},
+		});
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return jsonError(500, `flux-2 生成失败: ${msg}`);
+	}
+}
+
 async function handleGenerate(request: Request, env: Env): Promise<Response> {
 	let body: GenBody = {};
 	try {
@@ -225,9 +305,14 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 
 	const spec = getModel(body.model);
 
-	// Flux schnell：入参/输出格式都不一样，走专用路径
+	// Flux 1 schnell：JSON 入参 → JSON { image: b64 } 出参
 	if (spec.id === "@cf/black-forest-labs/flux-1-schnell") {
 		return handleFlux(body, env, spec);
+	}
+
+	// Flux 2 系列：用 multipart/form-data 调用
+	if (spec.multipart) {
+		return handleFlux2(body, env, spec);
 	}
 
 	const width = sanitizeDim(body.width, spec.needs === "image+mask" ? 512 : 1024);
@@ -297,6 +382,69 @@ function b64ToBytes(b64: string): number[] {
 	const out = new Array<number>(bin.length);
 	for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
 	return out;
+}
+
+// LLM 优化 prompt：用 LLM 把粗糙描述改写成 SD/Flux 风格的专业 prompt
+type OptimizeBody = {
+	prompt?: string;
+	model?: string;
+};
+
+const LLM_MODELS: Record<string, string> = {
+	"@cf/meta/llama-3.1-8b-instruct-fast": "Llama 3.1 8B (Fast)",
+	"@cf/qwen/qwen2.5-coder-32b-instruct": "Qwen 2.5 Coder 32B",
+};
+const DEFAULT_LLM = "@cf/meta/llama-3.1-8b-instruct-fast";
+
+const REWRITE_SYSTEM = `You are a professional Stable Diffusion / Flux prompt engineer. The user gives you a short or rough description. Rewrite it into a detailed, vivid image-generation prompt.
+
+Rules:
+- Include subject, action/pose, scene, style, lighting, camera angle
+- Use commas or line breaks to separate key elements
+- Keep it 80-200 words; dense with information
+- If the user wrote in Chinese, respond in Chinese (you can keep key English terms like "bokeh", "rim light"). If English, stay English
+- Output ONLY the rewritten prompt. No explanation, no quotes, no prefix`;
+
+async function handleOptimize(request: Request, env: Env): Promise<Response> {
+	let body: OptimizeBody = {};
+	try {
+		const ct = request.headers.get("content-type") || "";
+		if (ct.includes("application/json")) {
+			body = (await request.json()) as OptimizeBody;
+		} else {
+			const fd = await request.formData();
+			body = {
+				prompt: String(fd.get("prompt") || ""),
+				model: String(fd.get("model") || ""),
+			};
+		}
+	} catch {
+		return jsonError(400, "请求体解析失败");
+	}
+
+	const prompt = (body.prompt || "").trim();
+	if (!prompt) return jsonError(400, "原 prompt 不能为空");
+
+	const modelId =
+		body.model && LLM_MODELS[body.model] ? body.model : DEFAULT_LLM;
+
+	try {
+		const res = (await env.AI.run(modelId, {
+			messages: [
+				{ role: "system", content: REWRITE_SYSTEM },
+				{ role: "user", content: prompt },
+			],
+		})) as { response?: string };
+		const rewritten = (res?.response || "").trim();
+		if (!rewritten) return jsonError(500, "LLM 返回为空");
+		return new Response(
+			JSON.stringify({ prompt: rewritten, model: modelId, modelName: LLM_MODELS[modelId] }),
+			{ headers: { "content-type": "application/json; charset=utf-8" } },
+		);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return jsonError(500, `LLM 润色失败: ${msg}`);
+	}
 }
 
 function pageHTML(): string {
@@ -448,6 +596,11 @@ function pageHTML(): string {
   .history-empty { color: var(--muted); font-size: 12px; padding: 10px 0; }
 
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  .llm-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .llm-bar-label { font-size: 12px; color: var(--muted); }
+  .llm-bar-hint { font-size: 11px; color: var(--muted); margin-left: 4px; }
+  .llm-chip { background: var(--panel-2); }
+  .llm-chip:disabled { opacity: 0.4; cursor: wait; }
   .hidden { display: none !important; }
   .strength-row { transition: opacity .15s; }
   .strength-row.dim { opacity: 0.35; pointer-events: none; }
@@ -470,6 +623,12 @@ function pageHTML(): string {
         <div class="model-grid" id="modelGrid">${modelOptions}</div>
 
         <label class="field" for="prompt">提示词 (prompt)</label>
+        <div class="llm-bar">
+          <span class="llm-bar-label">✨ AI 润色：</span>
+          <button class="chip llm-chip" data-llm="@cf/meta/llama-3.1-8b-instruct-fast" type="button">Llama 3.1 8B</button>
+          <button class="chip llm-chip" data-llm="@cf/qwen/qwen2.5-coder-32b-instruct" type="button">Qwen 2.5 32B</button>
+          <span class="llm-bar-hint" title="CF Workers AI catalog 上 Qwen 2.5 系列没有部署 9B Instruct（只有 32B Coder 版），先用这个顶上">Qwen 2.5 9B CF 没部署 · 用 32B Coder 顶</span>
+        </div>
         <textarea id="prompt" placeholder="例：a cyberpunk girl with red hair, dynamic pose, neon city background, cinematic lighting"></textarea>
 
         <label class="field">角色参考图（默认已加载 protagonist.png；点图更换）</label>
@@ -963,6 +1122,36 @@ $("clearHistory").addEventListener("click", () => {
   if (confirm("清空所有历史？")) { saveHistory([]); renderHistory(); }
 });
 
+// AI 润色 prompt：调 /optimize 端点
+async function rewritePrompt(llmId) {
+  const original = promptEl.value.trim();
+  if (!original) { setStatus("先填提示词再让 AI 润色", "err"); promptEl.focus(); return; }
+  const chips = document.querySelectorAll(".llm-chip");
+  chips.forEach((c) => { c.disabled = true; });
+  setStatus("AI 润色中…");
+  try {
+    const res = await fetch("/optimize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: original, model: llmId }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      throw new Error(j.error || ("HTTP " + res.status));
+    }
+    const j = await res.json();
+    promptEl.value = j.prompt;
+    setStatus("AI 润色完成 ✓ " + (j.modelName || ""), "ok");
+  } catch (err) {
+    setStatus("润色失败：" + (err.message || err), "err");
+  } finally {
+    chips.forEach((c) => { c.disabled = false; });
+  }
+}
+document.querySelectorAll(".llm-chip").forEach((btn) => {
+  btn.addEventListener("click", () => rewritePrompt(btn.dataset.llm));
+});
+
 promptEl.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate();
 });
@@ -986,9 +1175,19 @@ export default {
 			return handleGenerate(request, env);
 		}
 
+		if (method === "POST" && url.pathname === "/optimize") {
+			return handleOptimize(request, env);
+		}
+
 		if (method === "GET" && url.pathname === "/healthz") {
 			return new Response(
-				JSON.stringify({ ok: true, models: Object.keys(MODELS), default: DEFAULT_MODEL }),
+				JSON.stringify({
+					ok: true,
+					imageModels: Object.keys(MODELS),
+					llmModels: Object.keys(LLM_MODELS),
+					defaultImage: DEFAULT_MODEL,
+					defaultLlm: DEFAULT_LLM,
+				}),
 				{ headers: { "content-type": "application/json; charset=utf-8" } },
 			);
 		}
