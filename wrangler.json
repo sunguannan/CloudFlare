@@ -6,6 +6,10 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS"
+	},
 	"observability": {
 		"enabled": true
 	}

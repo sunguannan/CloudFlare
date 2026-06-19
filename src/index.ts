@@ -369,11 +369,11 @@ function pageHTML(): string {
         <label class="field" for="prompt">提示词 (prompt)</label>
         <textarea id="prompt" placeholder="例：a cyberpunk girl with red hair, dynamic pose, neon city background, cinematic lighting"></textarea>
 
-        <label class="field">角色参考图（用于 img2img / inpainting；存到 localStorage，刷新不丢）</label>
+        <label class="field">角色参考图（默认已加载 protagonist.png；点图更换）</label>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
           <label class="file-drop" id="refDrop">
             <input type="file" id="refFile" accept="image/*" class="hidden" />
-            <div class="placeholder" style="padding: 0; font-size: 12px;">点击上传参考图</div>
+            <div class="placeholder" style="padding: 0; font-size: 12px;">加载中…</div>
           </label>
           <label class="file-drop" id="maskDrop">
             <input type="file" id="maskFile" accept="image/*" class="hidden" />
@@ -637,11 +637,27 @@ function rebindFileInput(id, onFile) {
   });
 }
 
-// 启动时恢复参考图
-try {
-  const saved = localStorage.getItem(LS_REF);
-  if (saved) { refDataUrl = saved; renderRef(); refreshModelChecked(); }
-} catch {}
+// 启动时恢复参考图：localStorage 优先；没有就 fetch /protagonist.png 作为默认
+async function loadDefaultRef() {
+  try {
+    const saved = localStorage.getItem(LS_REF);
+    if (saved) { refDataUrl = saved; renderRef(); refreshModelChecked(); return; }
+  } catch {}
+  try {
+    const r = await fetch("/protagonist.png", { cache: "force-cache" });
+    if (!r.ok) return;
+    const b = await r.blob();
+    refDataUrl = await blobToDataURL(b);
+    localStorage.setItem(LS_REF_NAME, "default · protagonist.png");
+    try { localStorage.setItem(LS_REF, refDataUrl); } catch {}
+    renderRef();
+    refreshModelChecked();
+    setStatus("已加载默认角色参考图 ✓", "ok");
+  } catch (e) {
+    console.warn("load default ref failed", e);
+  }
+}
+loadDefaultRef();
 
 // 历史
 function loadHistory() {
@@ -828,6 +844,20 @@ export default {
 				JSON.stringify({ ok: true, models: Object.keys(MODELS), default: DEFAULT_MODEL }),
 				{ headers: { "content-type": "application/json; charset=utf-8" } },
 			);
+		}
+
+		// 兜底：从绑定的静态资源读默认参考图
+		if (method === "GET" && url.pathname === "/protagonist.png") {
+			const assets = (env as Env & { ASSETS?: Fetcher }).ASSETS;
+			if (!assets) return new Response("ASSETS binding not configured", { status: 500 });
+			const obj = await assets.fetch("https://assets.local/protagonist.png");
+			if (!obj.ok) return new Response("default ref not found", { status: 404 });
+			return new Response(obj.body, {
+				headers: {
+					"content-type": "image/png",
+					"cache-control": "public, max-age=3600",
+				},
+			});
 		}
 
 		return new Response("Not Found", { status: 404 });
