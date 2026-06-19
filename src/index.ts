@@ -4,11 +4,13 @@
 //   POST /generate → 接受 JSON { model, prompt, width, height, negative_prompt?, strength?, num_steps?, guidance?, seed?, image_b64?, mask_b64? }
 //   GET  /healthz  → 健康检查
 //
-// 模型来源：CF Workers AI 免费 beta 模型
+// 模型来源：Cloudflare Workers AI
 //   - @cf/stabilityai/stable-diffusion-xl-base-1.0  (高质量文生图 / 也可 img2img，输出 jpeg)
 //   - @cf/bytedance/stable-diffusion-xl-lightning   (高速 SDXL，输出 jpeg)
 //   - @cf/runwayml/stable-diffusion-v1-5-img2img    (经典 img2img，512 推荐，输出 png)
 //   - @cf/runwayml/stable-diffusion-v1-5-inpainting (局部重绘，需要 image+mask，输出 png)
+//   - @cf/black-forest-labs/flux-2-klein-4b       (固定 4 steps，多参考图，输出 base64)
+//   - @cf/black-forest-labs/flux-2-klein-9b       (固定 4 steps，多参考图，输出 base64)
 
 type GenBody = {
 	model?: string;
@@ -32,6 +34,7 @@ type ModelSpec = {
 	needs: "none" | "image" | "image+mask";
 	output: "stream" | "json-b64";
 	multipart?: boolean; // true → 用 FormData 包装调用
+	fixedSteps?: number;
 	supports: {
 		width: boolean;
 		negative_prompt: boolean;
@@ -120,11 +123,27 @@ const MODELS: Record<string, ModelSpec> = {
 		needs: "none",
 		output: "json-b64",
 		multipart: true,
-		supports: { width: true, negative_prompt: false, strength: false, steps: true, seed: true },
+		fixedSteps: 4,
+		supports: { width: true, negative_prompt: false, strength: false, steps: false, seed: true },
 		stepsParam: "steps",
-		stepsDefault: 25,
-		stepsMax: 50,
-		hint: "FLUX.2 distilled 9B，几步出图质量好。支持 width/height/steps。",
+		stepsDefault: 4,
+		stepsMax: 4,
+		hint: "FLUX.2 distilled 9B，固定 4 steps，支持最多 4 张参考图。质量优先。",
+	},
+	"@cf/black-forest-labs/flux-2-klein-4b": {
+		id: "@cf/black-forest-labs/flux-2-klein-4b",
+		name: "Flux 2 Klein 4B",
+		tag: "Black Forest Labs · 4B distilled",
+		mime: "image/png",
+		needs: "none",
+		output: "json-b64",
+		multipart: true,
+		fixedSteps: 4,
+		supports: { width: true, negative_prompt: false, strength: false, steps: false, seed: true },
+		stepsParam: "steps",
+		stepsDefault: 4,
+		stepsMax: 4,
+		hint: "FLUX.2 distilled 4B，固定 4 steps，速度快、额度省，支持最多 4 张参考图。",
 	},
 	"@cf/black-forest-labs/flux-2-dev": {
 		id: "@cf/black-forest-labs/flux-2-dev",
@@ -162,9 +181,9 @@ function clamp(v: number, lo: number, hi: number): number {
 	return Math.max(lo, Math.min(hi, v));
 }
 
-function getModel(id: unknown): ModelSpec {
-	const s = typeof id === "string" ? MODELS[id] : undefined;
-	return s ?? MODELS[DEFAULT_MODEL]!;
+function getModel(id: unknown): ModelSpec | undefined {
+	if (id == null || id === "") return MODELS[DEFAULT_MODEL];
+	return typeof id === "string" ? MODELS[id] : undefined;
 }
 
 function jsonError(status: number, message: string): Response {
@@ -213,17 +232,15 @@ async function handleFlux(body: GenBody, env: Env, spec: ModelSpec): Promise<Res
 	}
 }
 
-// Flux 2 (klein-9b / dev)：用 multipart/form-data 调，输出也是 { image: b64 }
+// Flux 2 (klein-4b / klein-9b / dev)：用 multipart/form-data 调，输出也是 { image: b64 }
 async function handleFlux2(body: GenBody, env: Env, spec: ModelSpec): Promise<Response> {
 	const prompt = (body.prompt || "").trim();
 	if (!prompt) return jsonError(400, "提示词不能为空");
 
 	const width = sanitizeDim(body.width, 1024);
 	const height = sanitizeDim(body.height, 1024);
-	const steps = clamp(
-		Math.round(Number(body.num_steps) || spec.stepsDefault),
-		1,
-		spec.stepsMax,
+	const steps = spec.fixedSteps ?? clamp(
+		Math.round(Number(body.num_steps) || spec.stepsDefault), 1, spec.stepsMax,
 	);
 	const seed =
 		typeof body.seed === "number" && Number.isFinite(body.seed)
@@ -234,8 +251,16 @@ async function handleFlux2(body: GenBody, env: Env, spec: ModelSpec): Promise<Re
 	form.append("prompt", prompt);
 	form.append("width", String(width));
 	form.append("height", String(height));
-	form.append("steps", String(steps));
+	// Klein 4B/9B 在 Workers AI 上固定为 4 steps，不能传 steps 参数。
+	if (spec.fixedSteps == null) form.append("steps", String(steps));
 	if (seed != null) form.append("seed", String(seed));
+	if (typeof body.guidance === "number" && Number.isFinite(body.guidance)) {
+		form.append("guidance", String(clamp(body.guidance, 0, 30)));
+	}
+	if (body.image_b64) {
+		const imageBytes = new Uint8Array(b64ToBytes(body.image_b64));
+		form.append("input_image_0", new Blob([imageBytes], { type: detectImageMime(imageBytes) }), "reference");
+	}
 
 	// 把 FormData 包成 stream + content-type 传给 AI.run
 	const formResp = new Response(form);
@@ -254,7 +279,7 @@ async function handleFlux2(body: GenBody, env: Env, spec: ModelSpec): Promise<Re
 		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 		return new Response(bytes, {
 			headers: {
-				"content-type": "image/jpeg",
+				"content-type": detectImageMime(bytes),
 				"cache-control": "no-store",
 				"x-model": spec.id,
 			},
@@ -269,6 +294,8 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 	let body: GenBody = {};
 	try {
 		const ct = request.headers.get("content-type") || "";
+		const contentLength = Number(request.headers.get("content-length") || 0);
+		if (contentLength > 8 * 1024 * 1024) return jsonError(413, "请求体不能超过 8 MB");
 		if (ct.includes("application/json")) {
 			body = (await request.json()) as GenBody;
 		} else {
@@ -304,6 +331,7 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 	if (!prompt) return jsonError(400, "提示词不能为空");
 
 	const spec = getModel(body.model);
+	if (!spec) return jsonError(400, `不支持的模型: ${String(body.model || "")}`);
 
 	// Flux 1 schnell：JSON 入参 → JSON { image: b64 } 出参
 	if (spec.id === "@cf/black-forest-labs/flux-1-schnell") {
@@ -333,7 +361,7 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 		width,
 		height,
 		...(negative_prompt ? { negative_prompt } : {}),
-		...(body.image_b64 ? { image_b64: body.image_b64 } : {}),
+		...(body.image_b64 ? { image: b64ToBytes(body.image_b64) } : {}),
 		...(body.mask_b64 ? { mask: b64ToBytes(body.mask_b64) } : {}),
 		...(typeof body.strength === "number" && Number.isFinite(body.strength)
 			? { strength: clamp(body.strength, 0, 1) }
@@ -382,6 +410,16 @@ function b64ToBytes(b64: string): number[] {
 	const out = new Array<number>(bin.length);
 	for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
 	return out;
+}
+
+function detectImageMime(bytes: Uint8Array): string {
+	if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+		return "image/png";
+	}
+	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+		return "image/jpeg";
+	}
+	return "application/octet-stream";
 }
 
 // LLM 优化 prompt：用 LLM 把粗糙描述改写成 SD/Flux 风格的专业 prompt
@@ -612,7 +650,7 @@ function pageHTML(): string {
     <header>
       <div>
         <h1>Text → Image · 模型实验室</h1>
-        <div class="sub">Cloudflare Workers AI · 4 个免费模型对比调试</div>
+        <div class="sub">Cloudflare Workers AI · 多模型对比调试</div>
       </div>
       <div class="sub">POST <code>/generate</code></div>
     </header>
