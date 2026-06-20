@@ -8,7 +8,10 @@
 
 Generate images based on text prompts using [Workers AI](https://developers.cloudflare.com/workers-ai/). In this example, going to the website will generate an image from the prompt "cyberpunk cat" using the `@cf/stabilityai/stable-diffusion-xl-base-1.0` model. Be patient! Your image may take a few seconds to generate.
 
-The `/generate` API also supports `@cf/black-forest-labs/flux-2-klein-4b` and `@cf/black-forest-labs/flux-2-klein-9b`. Both Klein models use Cloudflare's multipart Workers AI input, fixed 4-step inference, and accept the optional JSON field `image_b64`, which is forwarded as binary multipart field `input_image_0`. Reference images must be smaller than 512×512.
+The `/generate` API also supports:
+
+- `@cf/black-forest-labs/flux-1-schnell`: default 4-step text-to-image generation. Cloudflare's API does not expose width, height, or reference-image inputs for this model, so its native output is fixed at 1024×1024.
+- `@cf/black-forest-labs/flux-2-klein-4b` and `@cf/black-forest-labs/flux-2-klein-9b`: fixed 4-step inference through Cloudflare's multipart Workers AI input. Both accept the optional JSON field `image_b64`, forwarded as binary multipart field `input_image_0`. Reference images must be smaller than 512×512.
 
 <!-- dash-content-end -->
 

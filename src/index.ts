@@ -9,6 +9,7 @@
 //   - @cf/bytedance/stable-diffusion-xl-lightning   (高速 SDXL，输出 jpeg)
 //   - @cf/runwayml/stable-diffusion-v1-5-img2img    (经典 img2img，512 推荐，输出 png)
 //   - @cf/runwayml/stable-diffusion-v1-5-inpainting (局部重绘，需要 image+mask，输出 png)
+//   - @cf/black-forest-labs/flux-1-schnell         (默认 4 steps，固定 1024×1024，输出 base64)
 //   - @cf/black-forest-labs/flux-2-klein-4b       (固定 4 steps，多参考图，输出 base64)
 //   - @cf/black-forest-labs/flux-2-klein-9b       (固定 4 steps，多参考图，输出 base64)
 
@@ -113,7 +114,7 @@ const MODELS: Record<string, ModelSpec> = {
 		stepsParam: "steps",
 		stepsDefault: 4,
 		stepsMax: 8,
-		hint: "12B rectified flow，几步出图（默认 4 步）。⚠️ 不支持自定义尺寸（只 1024×1024）/反向词/img2img。",
+		hint: "12B rectified flow，默认 4 steps，约 57.6 neurons/张。⚠️ 原生固定 1024×1024，不支持自定义尺寸、反向词或参考图。",
 	},
 	"@cf/black-forest-labs/flux-2-klein-9b": {
 		id: "@cf/black-forest-labs/flux-2-klein-9b",
